@@ -484,6 +484,8 @@ export const paginationSchema = z.object(
 
 export const $pagination = paginationSchema;
 
+const MAX_FILTER_PATTERN_LENGTH = 200;
+
 export const normalizeFilterExpression = (
   value?: string | number | boolean | z.output<typeof clientValueSchema>,
 ) => {
@@ -504,6 +506,15 @@ export const normalizeFilterExpression = (
         return new ObjectId(value.value);
 
       case "regex":
+        // Bounded because the pattern comes from the client and is run both
+        // here and by mongod. A length cap only raises the cost of a
+        // catastrophically backtracking pattern; it does not remove it.
+        if (value.value.length > MAX_FILTER_PATTERN_LENGTH) {
+          throw Response.badRequest(
+            `A filter pattern may not exceed ${MAX_FILTER_PATTERN_LENGTH} characters!`,
+          );
+        }
+
         return new RegExp(value.value, value.options?.regexFlags);
 
       case "null":
@@ -580,15 +591,22 @@ export const testFilters = <T extends Record<string, unknown>>(
         if (Array.isArray(expression)) {
           const targets = expression.map(normalizeFilterExpression).map(String);
 
+          // Arrays survive flattening intact, so compare element by element.
+          // Passing one through String() yields "a,b" and matched nothing,
+          // which quietly broke every rule written against an array field.
+          const actual = (Array.isArray(value) ? value : [value]).map(String);
+
           switch (operator) {
             case "$in":
-              success = targets.includes(String(value));
+              success = actual.some((item) => targets.includes(item));
               break;
             case "$nin":
-              success = !targets.includes(String(value));
+              success = !actual.some((item) => targets.includes(item));
               break;
             case "$all":
-              success = !targets.every((target) => target === String(value));
+              // Mongo's $all holds when every target is present. This was
+              // negated, so it held precisely when they were not.
+              success = targets.every((target) => actual.includes(target));
               break;
 
             default:
